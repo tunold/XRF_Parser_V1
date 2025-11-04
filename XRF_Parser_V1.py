@@ -1,13 +1,14 @@
 # app.py
 # Streamlit viewer for .spx files (counts + robust metadata)
 # - upload a .spx or use data/sample.spx
-# - optional metadata display
-# - optional spectrum plot
+# - consistent key-info table
+# - optional full metadata + spectrum plot
 
 import re
 import json
 import base64
 import struct
+import tempfile
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple, Iterable
 
@@ -19,13 +20,12 @@ import matplotlib.pyplot as plt
 
 
 # =========================
-#   Low-level utilities
+#   Low-level + parsing utils
 # =========================
 
 _NUM = re.compile(r"^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$")
 
 def _repair_spx_text(text: str) -> str:
-    """Fix common truncation of <Channels> lines (ensure closing tag)."""
     out = []
     for ln in text.splitlines():
         if "<Channels>" in ln and "</Channels>" not in ln:
@@ -46,11 +46,9 @@ def _to_num(s: Optional[str]) -> Optional[float]:
     return None
 
 def _localname(tag: str) -> str:
-    """Strip any XML namespace from a tag: '{ns}Current' -> 'Current'."""
     return tag.split('}', 1)[-1] if '}' in tag else tag
 
 def _load_spx_root(path: str, encoding: str = "cp1252") -> ET.Element:
-    """Robust XML loader with encoding fallbacks + channel repair."""
     for enc in (encoding, "utf-8", "latin-1", "iso-8859-1"):
         try:
             raw = Path(path).read_bytes().decode(enc, errors="replace")
@@ -58,17 +56,14 @@ def _load_spx_root(path: str, encoding: str = "cp1252") -> ET.Element:
             return ET.fromstring(fixed)
         except Exception:
             pass
-    # last resort
     fixed = _repair_spx_text(Path(path).read_bytes().decode("utf-8", errors="ignore"))
     return ET.fromstring(fixed)
 
 def _find_text_anywhere(root: ET.Element, tag: str) -> Optional[str]:
-    # exact tag
     for e in root.iter(tag):
         t = (e.text or "").strip()
         if t:
             return t
-    # case-insensitive by localname
     tl = tag.lower()
     for e in root.iter():
         if _localname(e.tag).lower() == tl:
@@ -78,7 +73,6 @@ def _find_text_anywhere(root: ET.Element, tag: str) -> Optional[str]:
     return None
 
 def _flatten_leaves(root: ET.Element) -> Dict[str, str]:
-    """Flatten all leaf nodes to dict: 'A/B/C' -> text."""
     out: Dict[str, str] = {}
     def rec(e: ET.Element, path: List[str]):
         kids = list(e)
@@ -92,13 +86,8 @@ def _flatten_leaves(root: ET.Element) -> Dict[str, str]:
     rec(root, [root.tag])
     return out
 
-
-# =========================
-#   Units & parsing
-# =========================
-
+# Units
 _UNIT_NUM = re.compile(r"^\s*([+-]?\d+(?:\.\d+)?)(?:\s*([A-Za-zµμ]+))?\s*$")
-
 def _parse_value_and_unit(s: str) -> Tuple[Optional[float], Optional[str]]:
     s = (s or "").strip()
     m = _UNIT_NUM.match(s)
@@ -107,9 +96,7 @@ def _parse_value_and_unit(s: str) -> Tuple[Optional[float], Optional[str]]:
             return float(s), None
         except Exception:
             return None, None
-    val = float(m.group(1))
-    unit = m.group(2)
-    return val, unit
+    return float(m.group(1)), m.group(2)
 
 def _to_kV(val: Optional[float], unit: Optional[str]) -> Optional[float]:
     if val is None:
@@ -153,20 +140,34 @@ def _length_to_mm(val: float, unit: Optional[str]) -> float:
         return float(val) * 1000.0
     return float(val)
 
+# Target element full names
+Z_TO_SYMBOL = {4:"Be", 13:"Al", 22:"Ti", 24:"Cr", 26:"Fe", 27:"Co", 28:"Ni", 29:"Cu",
+               42:"Mo", 45:"Rh", 46:"Pd", 47:"Ag", 74:"W", 78:"Pt", 79:"Au"}
+SYMBOL_TO_NAME = {
+    "Be":"Beryllium","Al":"Aluminium","Ti":"Titanium","Cr":"Chromium","Fe":"Iron","Co":"Cobalt",
+    "Ni":"Nickel","Cu":"Copper","Mo":"Molybdenum","Rh":"Rhodium","Pd":"Palladium","Ag":"Silver",
+    "W":"Tungsten","Pt":"Platinum","Au":"Gold"
+}
+
+def _parse_target_from_tubetype(tubetype: Optional[str]) -> Optional[str]:
+    if not tubetype:
+        return None
+    m = re.search(r"\b([A-Z][a-z]?)\b\s*$", tubetype.strip())
+    return m.group(1) if m else None
+
+def _z_to_symbol(z: Optional[float]) -> Optional[str]:
+    if z is None:
+        return None
+    zi = int(round(z))
+    return Z_TO_SYMBOL.get(zi)
 
 # =========================
 #   Stage extractor (with RTREM fallback)
 # =========================
 
 def extract_axes_with_rtrem_fallback(file_path: str) -> Dict[str, Dict[str, Any]]:
-    """
-    Extract stage axes from .spx.
-    1) Prefer Axis0/1/2 (AxisName/AxisPosition/AxisUnit).
-    2) Fallback: decode base64 <Data> blobs and locate a (X,Y,Z) float64 triple in mm.
-    """
     root = _load_spx_root(file_path)
 
-    # Canonical Axis*
     axes: Dict[str, Dict[str, Any]] = {}
     for elem in root.iter():
         tag_local = _localname(elem.tag)
@@ -183,7 +184,6 @@ def extract_axes_with_rtrem_fallback(file_path: str) -> Dict[str, Dict[str, Any]
     if axes:
         return axes
 
-    # Fallback: scan Data blobs
     def find_xyz_from_blob(blob: bytes):
         best = None
         for off in range(0, len(blob) - 24 + 1, 1):
@@ -220,7 +220,6 @@ def _extract_stage_any(path: str) -> Optional[Dict[str, float]]:
     axes = extract_axes_with_rtrem_fallback(path) or {}
     if not axes:
         return None
-
     def pick(axis_prefix: str) -> Optional[Tuple[float, Optional[str]]]:
         rec = axes.get(axis_prefix)
         if rec is None:
@@ -231,7 +230,6 @@ def _extract_stage_any(path: str) -> Optional[Dict[str, float]]:
         if rec is None:
             return None
         return float(rec.get("position")), rec.get("unit")
-
     out: Dict[str, float] = {}
     for axis in ("X", "Y", "Z"):
         got = pick(axis)
@@ -239,7 +237,6 @@ def _extract_stage_any(path: str) -> Optional[Dict[str, float]]:
             val, unit = got
             out[f"{axis}_mm"] = _length_to_mm(val, unit)
     return out or None
-
 
 # =========================
 #   XML navigation helpers
@@ -342,15 +339,6 @@ def _first_text_global_fuzzy(leaves_all: Dict[str, str], include: Iterable[str],
 #   Tube window helpers
 # =========================
 
-_Z_TO_SYM = {4:"Be", 13:"Al", 22:"Ti", 24:"Cr", 26:"Fe", 27:"Co", 28:"Ni", 29:"Cu",
-             42:"Mo", 45:"Rh", 46:"Pd", 47:"Ag", 74:"W", 78:"Pt", 79:"Au"}
-
-def _z_to_symbol(z: Optional[float]) -> Optional[str]:
-    if z is None:
-        return None
-    zi = int(round(z))
-    return _Z_TO_SYM.get(zi)
-
 def _tube_window_from_header_map(xrf_map: Dict[str, str]) -> Optional[Dict[str, Any]]:
     items = {k: v for k, v in xrf_map.items() if _localname(k).lower().startswith("tubewindow/")}
     if not items:
@@ -403,15 +391,8 @@ def _tube_window_from_leaves(leaves: Dict[str, str]) -> Optional[Dict[str, Any]]
                        "element": _z_to_symbol(Zi), "thickness_um": Ti, "relative_area": Ri})
     return {"filter_id": filter_id, "layers": layers}
 
-def _parse_target_from_tubetype(tubetype: Optional[str]) -> Optional[str]:
-    if not tubetype:
-        return None
-    m = re.search(r"\b([A-Z][a-z]?)\b\s*$", tubetype.strip())
-    return m.group(1) if m else None
-
-
 # =========================
-#   Instrument & environment
+#   Instrument + environment
 # =========================
 
 def _extract_instrument_and_env(root: ET.Element, calibration_for_embed: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -419,7 +400,7 @@ def _extract_instrument_and_env(root: ET.Element, calibration_for_embed: Dict[st
     xrf_ci = _find_classinstance_with_known_type(root, "RTXrfHeader")
     xrf = _flatten_container_excluding_knownheader(xrf_ci) if xrf_ci is not None else {}
 
-    # Detector (global leaves)
+    # Detector (basic)
     det: Dict[str, Any] = {}
     sel_raw = _first_by_key(leaves_all, "SelectedDetectors")
     if sel_raw:
@@ -446,19 +427,7 @@ def _extract_instrument_and_env(root: ET.Element, calibration_for_embed: Dict[st
                          ("ShapingTime","shaping_time")]:
         v = _to_num(_first_by_key(leaves_all, k_xml))
         if v is not None: det[k_out] = v
-    # Optional detector HV/current
-    for key_xml, out_key, conv in (
-        ("DetectorVoltage", "bias_voltage_kV", _to_kV),
-        ("BiasVoltage",     "bias_voltage_kV", _to_kV),
-        ("HV",              "bias_voltage_kV", _to_kV),
-        ("DetectorCurrent", "bias_current_uA", _to_uA),
-        ("BiasCurrent",     "bias_current_uA", _to_uA),
-    ):
-        txt = _first_by_key(leaves_all, key_xml)
-        if txt and out_key not in det:
-            v,u = _parse_value_and_unit(txt)
-            if v is not None:
-                det[out_key] = conv(v,u)
+    # embed calibration
     if calibration_for_embed:
         det["calibration"] = {
             "channel_count": calibration_for_embed.get("channel_count"),
@@ -466,7 +435,7 @@ def _extract_instrument_and_env(root: ET.Element, calibration_for_embed: Dict[st
             "offset_keV": calibration_for_embed.get("offset_keV"),
         }
 
-    # X-ray tube (prefer container values)
+    # Tube
     tube: Dict[str, Any] = {}
     tubetype = (xrf.get("TubeType") if xrf else None) or _first_by_key(leaves_all, "TubeType")
     if tubetype:
@@ -479,6 +448,7 @@ def _extract_instrument_and_env(root: ET.Element, calibration_for_embed: Dict[st
     if anode is not None:
         tube["anode_Z"] = int(round(anode))
         tube.setdefault("target", _z_to_symbol(anode))
+    # V/I robust
     vol_txt = (_first_text_in_container(xrf_ci, {"Voltage"})
                or (xrf.get("Voltage") if xrf else None)
                or _first_text_global_fuzzy(leaves_all, include={"Voltage", "TubeVoltage"}))
@@ -493,10 +463,8 @@ def _extract_instrument_and_env(root: ET.Element, calibration_for_embed: Dict[st
         v, u = _parse_value_and_unit(cur_txt)
         if v is not None:
             tube["current_uA"] = _to_uA(v, u)
-    inc = _to_num((xrf.get("TubeIncidentAngle") if xrf else None) or _first_by_key(leaves_all, "TubeIncidentAngle"))
-    if inc is not None: tube["incident_angle_deg"] = inc
-    tof = _to_num((xrf.get("TubeTakeOffAngle") if xrf else None) or _first_by_key(leaves_all, "TubeTakeOffAngle"))
-    if tof is not None: tube["takeoff_angle_deg"] = tof
+
+    # Window & filters
     window = _tube_window_from_header_map(xrf) if xrf else None
     if not window:
         window = _tube_window_from_leaves(leaves_all)
@@ -515,7 +483,7 @@ def _extract_instrument_and_env(root: ET.Element, calibration_for_embed: Dict[st
     if tube: instrument["xray_tube"] = tube
     if det:  instrument["detector"] = det
 
-    # Environment
+    # Environment (select keys)
     env: Dict[str, Any] = {}
     ch_type = xrf.get("ChassisType")   or _first_by_key(leaves_all, "ChassisType")
     ch_num  = xrf.get("ChassisNumber") or _first_by_key(leaves_all, "ChassisNumber")
@@ -576,14 +544,12 @@ def parse_spx_file(path: str, encoding: str = "cp1252") -> Dict[str, Any]:
                 break
     spec_name = spec_name or Path(path).stem
 
-    # Acquisition
     acquisition = {
         "real_time_ms": _to_num(_find_text_anywhere(root, "RealTime")),
         "live_time_ms": _to_num(_find_text_anywhere(root, "LifeTime")),
         "dead_time_percent": _to_num(_find_text_anywhere(root, "DeadTime")),
     }
 
-    # Calibration
     channel_count_txt = _find_text_anywhere(root, "ChannelCount")
     calibration = {
         "channel_count": int(float(channel_count_txt)) if channel_count_txt else None,
@@ -606,7 +572,7 @@ def parse_spx_file(path: str, encoding: str = "cp1252") -> Dict[str, Any]:
     # Stage
     stage = _extract_stage_any(path) or None
 
-    # Instrument + environment
+    # Instrument + env
     instrument, env = _extract_instrument_and_env(root, calibration_for_embed=calibration)
 
     return {
@@ -645,23 +611,30 @@ with st.sidebar:
     st.caption("If you upload a file, it takes precedence over the default.")
 
     st.header("Display options")
-    show_meta = st.checkbox("Show metadata", value=True)
+    show_meta = st.checkbox("Show full metadata blocks", value=False)
     show_plot = st.checkbox("Show spectrum plot", value=True)
 
-# Resolve input path
-tmp_path = None
+# Resolve input path; also keep a human-readable file name and a substrate ID guess
+original_filename = None
+substrate_id_autodetected = None
+
 if uploaded is not None:
-    # Save upload to a temp file for parsing
-    tmp_path = Path(st.experimental_get_query_params().get("tmpdir", ["."])[0]) / ("uploaded.spx")
-    tmp_path.write_bytes(uploaded.getvalue())
-    spx_path = str(tmp_path)
+    original_filename = uploaded.name  # show this to the user
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".spx") as tmp:
+        tmp.write(uploaded.getvalue())
+        spx_path = tmp.name
+    # We cannot know the original directory on the user's machine for uploads.
+    substrate_id_autodetected = "unknown (upload)"
 elif use_default:
     spx_path = default_path
+    p = Path(spx_path)
+    original_filename = p.name
+    substrate_id_autodetected = p.parent.name if p.parent.name else "(root)"
 else:
     st.info("Please upload a .spx or enable the default sample.")
     st.stop()
 
-# Parse and show
+# Parse
 try:
     rec = parse_spx_file(spx_path)
 except Exception as e:
@@ -669,28 +642,78 @@ except Exception as e:
     st.exception(e)
     st.stop()
 
-col1, col2 = st.columns([1,1])
+# Sidebar override for substrate ID
+with st.sidebar:
+    st.header("Sample info")
+    substrate_id = st.text_input("Substrate ID (defaults to directory name)", value=substrate_id_autodetected or "")
 
-with col1:
-    st.subheader("Header")
-    st.write(f"**Spectrum:** {rec['spectrum_name']}")
-    st.write(f"**File:** {rec['file']}")
-    acq = rec.get("acquisition", {}) or {}
-    st.write(f"**Acquisition:** real={acq.get('real_time_ms')} ms, live={acq.get('live_time_ms')} ms, dead={acq.get('dead_time_percent')}%")
-    st.write("**Stage (mm):**", rec.get("stage"))
+with st.sidebar:
+    # ---- Download parsed JSON ----
+    safe_name = Path(original_filename or rec.get("file") or "spectrum").stem
+    json_bytes = json.dumps(rec, ensure_ascii=False, indent=2).encode("utf-8")
 
+    st.download_button(
+        label="Download parsed JSON",
+        data=json_bytes,
+        file_name=f"{safe_name}_parsed.json",
+        mime="application/json",
+    )
+
+
+# --------- Uniform Key Info table ----------
+acq = rec.get("acquisition", {}) or {}
+inst = rec.get("instrument", {}) or {}
+xrt  = inst.get("xray_tube", {}) or {}
+det  = inst.get("detector", {}) or {}
+stage = rec.get("stage") or {}
+
+# Target full name
+target_sym = xrt.get("target")
+if not target_sym and xrt.get("anode_Z"):
+    target_sym = _z_to_symbol(xrt.get("anode_Z"))
+target_full = SYMBOL_TO_NAME.get(target_sym, target_sym) if target_sym else None
+xrt_label = target_full or (f"Z={xrt.get('anode_Z')}" if xrt.get("anode_Z") else "—")
+
+# Acquisition times → seconds strings
+def _sec_str(ms: Optional[float]) -> str:
+    if ms is None:
+        return "—"
+    return f"{ms/1000.0:.2f}s"
+
+key_rows = [
+    ("Substrate ID", substrate_id or "—"),
+    ("File name", original_filename or rec.get("file") or "—"),
+    ("Spectrum name", rec.get("spectrum_name") or "—"),
+    ("Acquisition time (real)", _sec_str(acq.get("real_time_ms"))),
+    ("Acquisition time (live)", _sec_str(acq.get("live_time_ms"))),
+    ("Dead time", f"{acq.get('dead_time_percent')}%" if acq.get("dead_time_percent") is not None else "—"),
+    ("X-ray tube target", xrt_label),
+    ("Voltage", f"{xrt.get('voltage_kV'):.2f} kV" if isinstance(xrt.get('voltage_kV'), (int,float)) else "—"),
+    ("Current", f"{xrt.get('current_uA'):.0f} µA" if isinstance(xrt.get('current_uA'), (int,float)) else "—"),
+    ("Detectors used", ", ".join(map(str, det.get("detectors_used") or [])) if det.get("detectors_used") else "—"),
+    ("Detector count", str(det.get("count")) if det.get("count") is not None else "—"),
+    ("Position X (mm)", f"{stage.get('X_mm'):.3f}" if isinstance(stage.get("X_mm"), (int,float)) else "—"),
+    ("Position Y (mm)", f"{stage.get('Y_mm'):.3f}" if isinstance(stage.get("Y_mm"), (int,float)) else "—"),
+]
+
+st.subheader("Key info")
+df_key = pd.DataFrame(key_rows, columns=["Parameter", "Value"])
+st.table(df_key)
+
+# --------- Optional full metadata ----------
 if show_meta:
-    with col2:
-        st.subheader("Metadata")
-        inst = rec.get("instrument") or {}
-        env  = rec.get("measurement_environment") or {}
+    st.subheader("Full metadata blocks")
+    m1, m2 = st.columns(2)
+    with m1:
         st.markdown("**Instrument → X-ray tube**")
-        st.json(inst.get("xray_tube") or {})
+        st.json(xrt)
         st.markdown("**Instrument → Detector**")
-        st.json(inst.get("detector") or {})
+        st.json(det)
+    with m2:
         st.markdown("**Measurement environment**")
-        st.json(env)
+        st.json(rec.get("measurement_environment") or {})
 
+# --------- Spectrum plot ----------
 if show_plot:
     counts = np.array(rec.get("counts") or [], dtype=float)
     if counts.size == 0:
@@ -706,6 +729,8 @@ if show_plot:
         ax.grid(True, alpha=0.3)
         st.pyplot(fig, clear_figure=True)
 
-# Footer: raw JSON expander
+# Raw JSON (optional)
 with st.expander("Raw parsed record (JSON)"):
     st.code(json.dumps(rec, indent=2), language="json")
+
+
